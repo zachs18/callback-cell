@@ -1,14 +1,10 @@
-
 use crate::*;
 use std::{
-    sync::{
-        Arc,
-        atomic::{
-            AtomicU32,
-            Ordering,
-        },
-    },
     ops::Add,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
 };
 
 #[test]
@@ -58,10 +54,10 @@ fn without_args_test() {
 #[test]
 fn with_args_test() {
     #[derive(Debug)]
-    struct Thing(i32, &'static AtomicU32);
+    struct Thing(i32, Box<AtomicU32>);
     impl From<i32> for Thing {
         fn from(n: i32) -> Self {
-            Thing(n, Box::leak(Box::new(AtomicU32::new(0))))
+            Thing(n, Box::new(AtomicU32::new(0)))
         }
     }
     impl Drop for Thing {
@@ -121,4 +117,3 @@ fn with_args_test() {
     assert_eq!(cell.take_call(Thing::from(50000)).unwrap_err().0, 50000);
     assert_eq!(counter.load(Ordering::Relaxed), 104);
 }
-
