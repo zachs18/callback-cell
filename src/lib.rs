@@ -1,12 +1,10 @@
 #![doc = include_str!("../README.md")]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(test)]
 mod test;
 
-mod without_args;
 mod with_args;
+mod without_args;
 
-pub use self::{
-    without_args::CallbackCell,
-    with_args::CallbackCellArgs,
-};
+pub use self::{with_args::CallbackCellArgs, without_args::CallbackCell};

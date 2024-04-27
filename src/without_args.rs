@@ -1,16 +1,6 @@
-
 use std::{
-    sync::atomic::{
-        AtomicUsize,
-        Ordering,
-    },
-    alloc::{
-        Layout,
-        alloc,
-        dealloc,
-        handle_alloc_error,
-    },
-    fmt::{self, Formatter, Debug},
+    fmt::{self, Debug, Formatter},
+    sync::atomic::{AtomicPtr, Ordering},
 };
 
 // internals
@@ -30,32 +20,34 @@ use std::{
 /// Like an `Atomic<Option<Box<dyn FnOnce() + Send + 'static>>>`.
 ///
 /// See [`CallbackCellArgs`][crate::CallbackCellArgs] for a version with args.
-pub struct CallbackCell(AtomicUsize);
+pub struct CallbackCell(AtomicPtr<CallbackCellInner<()>>);
+
+#[repr(C)]
+struct CallbackCellInner<F> {
+    fn_ptr: unsafe fn(bool, *mut CallbackCellInner<()>),
+    tail: F,
+}
 
 impl CallbackCell {
     /// Construct with no callback.
     pub fn new() -> Self {
-        CallbackCell(AtomicUsize::new(0))
+        CallbackCell(AtomicPtr::new(std::ptr::null_mut()))
     }
 
     /// Atomically set the callback.
     pub fn put<F: FnOnce() + Send + 'static>(&self, f: F) {
+        let bx = Box::new(CallbackCellInner {
+            fn_ptr: fn_ptr_impl::<F>,
+            tail: f,
+        });
+        let ptr = Box::into_raw(bx);
+
+        // atomic put
+        let old_ptr = self.0.swap(ptr.cast(), Ordering::AcqRel);
+
+        // clean up previous value
         unsafe {
-            // allocate and initialize heap allocation
-            let (layout, callback_offset) = Layout::new::<unsafe fn(bool, *mut u8)>()
-                .extend(Layout::new::<F>()).unwrap();
-            let ptr = alloc(layout);
-            if ptr.is_null() {
-                handle_alloc_error(layout);
-            }
-            (ptr as *mut unsafe fn(bool, *mut u8)).write(fn_ptr_impl::<F>);
-            (ptr.add(callback_offset) as *mut F).write(f);
-
-            // atomic put
-            let old_ptr = self.0.swap(ptr as usize, Ordering::Release);
-
-            // clean up previous value
-            drop_raw(old_ptr as *mut u8);
+            drop_raw(old_ptr);
         }
     }
 
@@ -63,18 +55,18 @@ impl CallbackCell {
     ///
     /// Returns true if a callback was present.
     pub fn take_call(&self) -> bool {
-        unsafe {
-            // atomic take
-            let ptr = self.0.swap(0, Ordering::Acquire) as *mut u8;
+        // atomic take
+        let ptr = self.0.swap(std::ptr::null_mut(), Ordering::AcqRel);
 
-            // run it
-            if !ptr.is_null() {
-                let fn_ptr = (ptr as *mut unsafe fn(bool, *mut u8)).read();
+        // run it
+        if !ptr.is_null() {
+            unsafe {
+                let fn_ptr = (*ptr).fn_ptr;
                 fn_ptr(true, ptr);
-                true
-            } else {
-                false
             }
+            true
+        } else {
+            false
         }
     }
 }
@@ -82,31 +74,30 @@ impl CallbackCell {
 impl Drop for CallbackCell {
     fn drop(&mut self) {
         unsafe {
-            drop_raw(*self.0.get_mut() as *mut u8);
+            drop_raw(*self.0.get_mut());
         }
     }
 }
 
 // implementation for the function pointer for a given callback type F.
-unsafe fn fn_ptr_impl<F: FnOnce() + Send + 'static>(run: bool, ptr: *mut u8) {
-    // extract callback value from heap allocation and free heap allocation
-    let (layout, callback_offset) = Layout::new::<unsafe fn(bool, *mut u8)>()
-        .extend(Layout::new::<F>()).unwrap();
-    let f = (ptr.add(callback_offset) as *mut F).read();
-    dealloc(ptr, layout);
+unsafe fn fn_ptr_impl<F: FnOnce() + Send + 'static>(run: bool, ptr: *mut CallbackCellInner<()>) {
+    let ptr: *mut CallbackCellInner<F> = ptr.cast();
+    let bx = unsafe { Box::from_raw(ptr) };
 
     // this part is basically safe code
     if run {
-        f();
+        (bx.tail)();
     }
 }
 
 // drop the pointed to data, including freeing the heap allocation, without running the callback,
 // if the pointer is non-null.
-unsafe fn drop_raw(ptr: *mut u8) {
+unsafe fn drop_raw(ptr: *mut CallbackCellInner<()>) {
     if !ptr.is_null() {
-        let fn_ptr = (ptr as *mut unsafe fn(bool, *mut u8)).read();
-        fn_ptr(false, ptr);
+        unsafe {
+            let fn_ptr = (*ptr).fn_ptr;
+            fn_ptr(false, ptr);
+        }
     }
 }
 

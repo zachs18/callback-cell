@@ -1,19 +1,8 @@
-
-
 use std::{
-    sync::atomic::{
-        AtomicUsize,
-        Ordering,
-    },
-    alloc::{
-        Layout,
-        alloc,
-        dealloc,
-        handle_alloc_error,
-    },
+    fmt::{self, Debug, Formatter},
     marker::PhantomData,
     mem::ManuallyDrop,
-    fmt::{self, Formatter, Debug},
+    sync::atomic::{AtomicPtr, Ordering},
 };
 
 // internals
@@ -37,15 +26,21 @@ use std::{
 ///
 /// It's a normal [`CallbackCell`][crate::CallbackCell] but with args.
 pub struct CallbackCellArgs<I, O> {
-    ptr: AtomicUsize,
+    ptr: AtomicPtr<CallbackCellInner<(), I, O>>,
     _p: PhantomData<dyn FnOnce(I) -> O + Send + 'static>,
+}
+
+#[repr(C)]
+struct CallbackCellInner<F, I, O> {
+    fn_ptr: unsafe fn(Option<&mut IoSlot<I, O>>, *mut CallbackCellInner<(), I, O>),
+    tail: F,
 }
 
 impl<I, O> CallbackCellArgs<I, O> {
     /// Construct with no callback.
     pub fn new() -> Self {
         CallbackCellArgs {
-            ptr: AtomicUsize::new(0),
+            ptr: AtomicPtr::new(std::ptr::null_mut()),
             _p: PhantomData,
         }
     }
@@ -54,22 +49,18 @@ impl<I, O> CallbackCellArgs<I, O> {
     ///
     /// Makes only one heap allocation. Any callback previously present is dropped.
     pub fn put<F: FnOnce(I) -> O + Send + 'static>(&self, f: F) {
+        let bx = Box::new(CallbackCellInner {
+            fn_ptr: fn_ptr_impl::<F, I, O>,
+            tail: f,
+        });
+        let ptr = Box::into_raw(bx);
+
+        // atomic put
+        let old_ptr = self.ptr.swap(ptr.cast(), Ordering::AcqRel);
+
+        // clean up previous value
         unsafe {
-            // allocate and initialize heap allocation
-            let (layout, callback_offset) = Layout::new::<FnPtrType<I, O>>()
-                .extend(Layout::new::<F>()).unwrap();
-            let ptr = alloc(layout);
-            if ptr.is_null() {
-                handle_alloc_error(layout);
-            }
-            (ptr as *mut FnPtrType<I, O>).write(fn_ptr_impl::<I, O, F>);
-            (ptr.add(callback_offset) as *mut F).write(f);
-
-            // atomic put
-            let old_ptr = self.ptr.swap(ptr as usize, Ordering::Release);
-
-            // clean up previous value
-            drop_raw::<I, O>(old_ptr as *mut u8);
+            drop_raw(old_ptr);
         }
     }
 
@@ -78,19 +69,18 @@ impl<I, O> CallbackCellArgs<I, O> {
     /// Returns the output if a callback was present. If a callback was not
     /// present, returns the original input.
     pub fn take_call(&self, input: I) -> Result<O, I> {
-        unsafe {
-            // atomic take
-            let ptr = self.ptr.swap(0, Ordering::Acquire) as *mut u8;
-
-            // run it
-            if !ptr.is_null() {
-                let fn_ptr = (ptr as *mut FnPtrType<I, O>).read();
-                let mut io_slot = IoSlot { input: ManuallyDrop::new(input) };
-                fn_ptr(Some(&mut io_slot), ptr);
-                Ok(ManuallyDrop::into_inner(io_slot.output))
-            } else {
-                Err(input)
-            }
+        // atomic take
+        let ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        // run it
+        if !ptr.is_null() {
+            let fn_ptr = unsafe { (*ptr).fn_ptr };
+            let mut io_slot = IoSlot {
+                input: ManuallyDrop::new(input),
+            };
+            unsafe { fn_ptr(Some(&mut io_slot), ptr) };
+            Ok(ManuallyDrop::into_inner(unsafe { io_slot.output }))
+        } else {
+            Err(input)
         }
     }
 }
@@ -98,7 +88,7 @@ impl<I, O> CallbackCellArgs<I, O> {
 impl<I, O> Drop for CallbackCellArgs<I, O> {
     fn drop(&mut self) {
         unsafe {
-            drop_raw::<I, O>(*self.ptr.get_mut() as *mut u8);
+            drop_raw(*self.ptr.get_mut());
         }
     }
 }
@@ -108,31 +98,32 @@ union IoSlot<I, O> {
     output: ManuallyDrop<O>,
 }
 
-type FnPtrType<I, O> = unsafe fn(Option<&mut IoSlot<I, O>>, *mut u8);
-
 // implementation for the function pointer for a given callback type F.
-unsafe fn fn_ptr_impl<I, O, F>(run: Option<&mut IoSlot<I, O>>, ptr: *mut u8)
-where
+unsafe fn fn_ptr_impl<F, I, O>(
+    run: Option<&mut IoSlot<I, O>>,
+    ptr: *mut CallbackCellInner<(), I, O>,
+) where
     F: FnOnce(I) -> O + Send + 'static,
 {
-    // extract callback value from heap allocation and free heap allocation
-    let (layout, callback_offset) = Layout::new::<FnPtrType<I, O>>()
-        .extend(Layout::new::<F>()).unwrap();
-    let f = (ptr.add(callback_offset) as *mut F).read();
-    dealloc(ptr, layout);
+    let ptr: *mut CallbackCellInner<F, I, O> = ptr.cast();
+    let bx = unsafe { Box::from_raw(ptr) };
 
-    // run
-    if let Some(io_slot) = run {
-        io_slot.output = ManuallyDrop::new(f(ManuallyDrop::take(&mut io_slot.input)));
+    // this part is basically safe code
+    if let Some(io) = run {
+        let input = unsafe { ManuallyDrop::take(&mut io.input) };
+        let output = (bx.tail)(input);
+        io.output = ManuallyDrop::new(output);
     }
 }
 
 // drop the pointed to data, including freeing the heap allocation, without running the callback,
 // if the pointer is non-null.
-unsafe fn drop_raw<I, O>(ptr: *mut u8) {
+unsafe fn drop_raw<I, O>(ptr: *mut CallbackCellInner<(), I, O>) {
     if !ptr.is_null() {
-        let fn_ptr = (ptr as *mut FnPtrType<I, O>).read();
-        fn_ptr(None, ptr);
+        unsafe {
+            let fn_ptr = (*ptr).fn_ptr;
+            fn_ptr(None, ptr);
+        }
     }
 }
 
